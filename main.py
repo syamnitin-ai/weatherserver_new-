@@ -1,5 +1,6 @@
 
 import os
+import re
 import sys
 from typing import Any
 import httpx
@@ -42,6 +43,69 @@ async def fetch_serpapi(query: str) -> dict[str, Any] | None:
         except Exception as e:
             print(f"SerpApi request failed: {e}", file=sys.stderr)
             return None
+
+
+def _collect_strings(node: Any) -> list[str]:
+    """Collect all string leaves from nested JSON-like objects."""
+    strings: list[str] = []
+    if isinstance(node, str):
+        strings.append(node)
+    elif isinstance(node, dict):
+        for value in node.values():
+            strings.extend(_collect_strings(value))
+    elif isinstance(node, list):
+        for value in node:
+            strings.extend(_collect_strings(value))
+    return strings
+
+
+def _find_first_value(node: Any, keys: set[str]) -> str | None:
+    """Find the first non-empty value for matching keys in nested data."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key.lower() in keys and value not in (None, ""):
+                return str(value)
+            found = _find_first_value(value, keys)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = _find_first_value(item, keys)
+            if found:
+                return found
+    return None
+
+
+def _extract_aqi_from_text(text: str) -> str | None:
+    """Extract numeric AQI value from free text."""
+    patterns = [
+        r"\bAQI\s*[:\-]?\s*(\d{1,3})\b",
+        r"\bAir Quality Index\s*[:\-]?\s*(\d{1,3})\b",
+        r"\bUS AQI\s*[:\-]?\s*(\d{1,3})\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _extract_status_from_text(text: str) -> str | None:
+    """Extract AQI status phrase from free text."""
+    statuses = [
+        "Good",
+        "Moderate",
+        "Poor",
+        "Unhealthy for Sensitive Groups",
+        "Unhealthy",
+        "Very Unhealthy",
+        "Hazardous",
+    ]
+    lower_text = text.lower()
+    for status in statuses:
+        if status.lower() in lower_text:
+            return status
+    return None
 
 
 # ── Tool 1: Current weather ──────────────────────────────────────
@@ -138,17 +202,36 @@ async def get_aqi(city: str) -> str:
         return "Error: Could not connect to SerpApi. Check your API key and internet connection."
 
     answer = data.get("answer_box", {}) or {}
+    local_results = data.get("local_results", []) or []
 
-    # Fallback: sometimes AQI-like data appears in local results.
-    if not answer:
-        local_results = data.get("local_results", []) or []
-        if local_results:
-            answer = local_results[0]
+    # Search across full payload because AQI can be in different paths per region/query.
+    search_space: dict[str, Any] = {
+        "answer_box": answer,
+        "knowledge_graph": data.get("knowledge_graph", {}),
+        "local_results": local_results,
+        "organic_results": data.get("organic_results", []) or [],
+    }
 
-    aqi_value = answer.get("value") or answer.get("aqi") or "N/A"
-    status = answer.get("status") or answer.get("category") or "Unknown"
-    pm25 = answer.get("pm25") or answer.get("PM2.5") or "N/A"
-    pm10 = answer.get("pm10") or answer.get("PM10") or "N/A"
+    aqi_value = (
+        _find_first_value(search_space, {"aqi", "value", "aqi_value", "us_aqi"})
+        or _find_first_value(search_space, {"current_aqi", "air_quality_index"})
+        or "N/A"
+    )
+    status = _find_first_value(search_space, {"status", "category", "quality"}) or "Unknown"
+    pm25 = _find_first_value(search_space, {"pm25", "pm2.5", "pm_2_5"}) or "N/A"
+    pm10 = _find_first_value(search_space, {"pm10", "pm_10"}) or "N/A"
+
+    # Final fallback: parse snippets/text for AQI/status if structured fields are missing.
+    if aqi_value == "N/A" or status == "Unknown":
+        all_text = " ".join(_collect_strings(search_space))
+        if aqi_value == "N/A":
+            parsed_aqi = _extract_aqi_from_text(all_text)
+            if parsed_aqi:
+                aqi_value = parsed_aqi
+        if status == "Unknown":
+            parsed_status = _extract_status_from_text(all_text)
+            if parsed_status:
+                status = parsed_status
 
     recommendation = "Good - Suitable for normal outdoor activities."
     status_l = str(status).lower()
