@@ -123,6 +123,116 @@ async def get_weather_forecast(city: str) -> str:
     return header + "\n" + "\n".join(lines)
 
 
+# ── Tool 3: Air Quality Index ─────────────────────────────────────
+@mcp.tool()
+async def get_aqi(city: str) -> str:
+    """
+    Get Air Quality Index (AQI) details for a city.
+    Returns AQI value, status category, PM2.5, PM10, and basic health advice.
+
+    Args:
+        city: The city name to get AQI for, e.g. 'Delhi', 'Mumbai', 'London'
+    """
+    data = await fetch_serpapi(f"air quality index {city}")
+    if not data:
+        return "Error: Could not connect to SerpApi. Check your API key and internet connection."
+
+    answer = data.get("answer_box", {}) or {}
+
+    # Fallback: sometimes AQI-like data appears in local results.
+    if not answer:
+        local_results = data.get("local_results", []) or []
+        if local_results:
+            answer = local_results[0]
+
+    aqi_value = answer.get("value") or answer.get("aqi") or "N/A"
+    status = answer.get("status") or answer.get("category") or "Unknown"
+    pm25 = answer.get("pm25") or answer.get("PM2.5") or "N/A"
+    pm10 = answer.get("pm10") or answer.get("PM10") or "N/A"
+
+    recommendation = "Good - Suitable for normal outdoor activities."
+    status_l = str(status).lower()
+    if "hazardous" in status_l:
+        recommendation = "Hazardous - Avoid outdoor exposure; use air purifier and mask."
+    elif "very unhealthy" in status_l:
+        recommendation = "Very Unhealthy - Stay indoors as much as possible."
+    elif "unhealthy" in status_l:
+        recommendation = "Unhealthy - Reduce prolonged outdoor exertion."
+    elif "poor" in status_l:
+        recommendation = "Poor - Use N95 mask outdoors and limit heavy activity."
+    elif "moderate" in status_l:
+        recommendation = "Moderate - Sensitive groups should limit outdoor time."
+
+    return f"""
+Air Quality Index — {city}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+AQI Value      : {aqi_value}
+Status         : {status}
+PM2.5          : {pm25}
+PM10           : {pm10}
+
+Health Advice:
+{recommendation}
+""".strip()
+
+
+# ── Tool 4: Best tourist spots ────────────────────────────────────
+@mcp.tool()
+async def get_best_tourist_spots(city: str) -> str:
+    """
+    Get the best tourist spots in a city.
+    Returns a short ranked list of attractions with practical visiting tips.
+
+    Args:
+        city: The city name to discover places in, e.g. 'Delhi', 'Mumbai', 'London'
+    """
+    data = await fetch_serpapi(f"best tourist spots in {city}")
+    if not data:
+        return "Error: Could not connect to SerpApi. Check your API key and internet connection."
+
+    places: list[str] = []
+
+    local_results = data.get("local_results", []) or []
+    for item in local_results[:7]:
+        name = item.get("title") or item.get("name")
+        if name:
+            places.append(str(name).strip())
+
+    if not places:
+        organic_results = data.get("organic_results", []) or []
+        for item in organic_results[:7]:
+            title = item.get("title")
+            if title:
+                places.append(str(title).strip())
+
+    if not places:
+        return f"Could not find tourist spot results for '{city}'. Try a more specific location like '{city}, India'."
+
+    # De-duplicate while keeping order.
+    seen: set[str] = set()
+    unique_places: list[str] = []
+    for place in places:
+        key = place.lower()
+        if key not in seen:
+            seen.add(key)
+            unique_places.append(place)
+
+    top_places = unique_places[:5]
+    place_lines = "\n".join(f"{idx}. {name}" for idx, name in enumerate(top_places, start=1))
+
+    return f"""
+Best Tourist Spots — {city}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Top recommendations:
+{place_lines}
+
+Tips:
+- Visit popular landmarks early morning to avoid crowds.
+- Keep at least one indoor attraction as backup for bad weather.
+- Check official timings and ticket details before visiting.
+""".strip()
+
+
 # ── Run the server ───────────────────────────────────────────────
 if __name__ == "__main__":
     # IMPORTANT: Never use print() here — it writes to stdout and
