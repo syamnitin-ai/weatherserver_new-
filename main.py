@@ -90,6 +90,29 @@ def _extract_aqi_from_text(text: str) -> str | None:
     return None
 
 
+def _extract_numeric(text: str) -> str | None:
+    """Return first 1-3 digit number found in text."""
+    match = re.search(r"\b(\d{1,3})\b", text)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _normalize_aqi_value(value: Any) -> str | None:
+    """Normalize AQI value to numeric string when possible."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        number = int(value)
+        return str(number) if 0 <= number <= 500 else None
+    text = str(value).strip()
+    numeric = _extract_numeric(text)
+    if numeric is None:
+        return None
+    number = int(numeric)
+    return numeric if 0 <= number <= 500 else None
+
+
 def _extract_status_from_text(text: str) -> str | None:
     """Extract AQI status phrase from free text."""
     statuses = [
@@ -106,6 +129,44 @@ def _extract_status_from_text(text: str) -> str | None:
         if status.lower() in lower_text:
             return status
     return None
+
+
+def _looks_like_article_heading(title: str) -> bool:
+    """Filter out blog/article/listing-style headings."""
+    lowered = title.lower()
+    blocked_terms = [
+        "things to do",
+        "best things",
+        "top places",
+        "must-visit",
+        "what are some",
+        "tourist places",
+        "guide",
+        "itinerary",
+        "in 2026",
+        "blog",
+        "tripadvisor",
+        "wikipedia",
+    ]
+    return any(term in lowered for term in blocked_terms)
+
+
+def _best_visit_time_for_place(place_name: str) -> str:
+    """Return a practical best-time window based on place type."""
+    name = place_name.lower()
+    if any(word in name for word in ["temple", "gurudwara", "church", "mosque", "shrine"]):
+        return "6:00 AM - 9:00 AM (peaceful hours, fewer queues)"
+    if any(word in name for word in ["park", "garden", "lake", "beach", "waterfall", "fort"]):
+        return "6:30 AM - 10:00 AM or 4:30 PM - 6:30 PM (pleasant weather)"
+    if any(word in name for word in ["museum", "gallery", "planetarium", "science"]):
+        return "11:00 AM - 2:00 PM (ideal indoor timing)"
+    if any(word in name for word in ["mall", "market", "bazaar", "street", "plaza"]):
+        return "5:00 PM - 8:30 PM (best atmosphere and shopping)"
+    if any(word in name for word in ["zoo", "safari", "bird"]):
+        return "8:00 AM - 11:00 AM (animals most active)"
+    if any(word in name for word in ["amusement", "theme park", "water park"]):
+        return "10:00 AM - 1:00 PM and 4:00 PM - 7:00 PM"
+    return "8:00 AM - 11:00 AM or 5:00 PM - 7:00 PM (generally best for sightseeing)"
 
 
 # ── Tool 1: Current weather ──────────────────────────────────────
@@ -212,11 +273,11 @@ async def get_aqi(city: str) -> str:
         "organic_results": data.get("organic_results", []) or [],
     }
 
-    aqi_value = (
+    aqi_raw = (
         _find_first_value(search_space, {"aqi", "value", "aqi_value", "us_aqi"})
         or _find_first_value(search_space, {"current_aqi", "air_quality_index"})
-        or "N/A"
     )
+    aqi_value = _normalize_aqi_value(aqi_raw) or "N/A"
     status = _find_first_value(search_space, {"status", "category", "quality"}) or "Unknown"
     pm25 = _find_first_value(search_space, {"pm25", "pm2.5", "pm_2_5"}) or "N/A"
     pm10 = _find_first_value(search_space, {"pm10", "pm_10"}) or "N/A"
@@ -232,6 +293,30 @@ async def get_aqi(city: str) -> str:
             parsed_status = _extract_status_from_text(all_text)
             if parsed_status:
                 status = parsed_status
+
+    # If status was captured as a number-like value, convert it to proper status.
+    if status != "Unknown":
+        status_numeric = _normalize_aqi_value(status)
+        if status_numeric:
+            status = "Unknown"
+
+    # Backfill missing status from AQI number bands.
+    if status == "Unknown":
+        aqi_num = _normalize_aqi_value(aqi_value)
+        if aqi_num is not None:
+            value = int(aqi_num)
+            if value <= 50:
+                status = "Good"
+            elif value <= 100:
+                status = "Moderate"
+            elif value <= 150:
+                status = "Unhealthy for Sensitive Groups"
+            elif value <= 200:
+                status = "Unhealthy"
+            elif value <= 300:
+                status = "Very Unhealthy"
+            else:
+                status = "Hazardous"
 
     recommendation = "Good - Suitable for normal outdoor activities."
     status_l = str(status).lower()
@@ -269,50 +354,67 @@ async def get_best_tourist_spots(city: str) -> str:
     Args:
         city: The city name to discover places in, e.g. 'Delhi', 'Mumbai', 'London'
     """
-    data = await fetch_serpapi(f"best tourist spots in {city}")
-    if not data:
-        return "Error: Could not connect to SerpApi. Check your API key and internet connection."
+    queries = [
+        f"top attractions in {city}",
+        f"famous places to visit in {city}",
+        f"must visit landmarks in {city}",
+    ]
 
-    places: list[str] = []
+    all_places: list[str] = []
 
-    local_results = data.get("local_results", []) or []
-    for item in local_results[:7]:
-        name = item.get("title") or item.get("name")
-        if name:
-            places.append(str(name).strip())
+    for query in queries:
+        data = await fetch_serpapi(query)
+        if not data:
+            continue
 
-    if not places:
+        local_results = data.get("local_results", []) or []
+        for item in local_results[:10]:
+            name = item.get("title") or item.get("name")
+            if name:
+                clean_name = str(name).strip()
+                if not _looks_like_article_heading(clean_name):
+                    all_places.append(clean_name)
+
         organic_results = data.get("organic_results", []) or []
-        for item in organic_results[:7]:
+        for item in organic_results[:10]:
             title = item.get("title")
             if title:
-                places.append(str(title).strip())
+                clean_title = str(title).strip()
+                if not _looks_like_article_heading(clean_title):
+                    all_places.append(clean_title)
 
-    if not places:
-        return f"Could not find tourist spot results for '{city}'. Try a more specific location like '{city}, India'."
+    if not all_places:
+        return (
+            f"Could not find structured tourist places for '{city}' right now. "
+            f"Try a more specific location like '{city}, India'."
+        )
 
-    # De-duplicate while keeping order.
     seen: set[str] = set()
     unique_places: list[str] = []
-    for place in places:
-        key = place.lower()
-        if key not in seen:
-            seen.add(key)
-            unique_places.append(place)
+    for place in all_places:
+        normalized = re.sub(r"\s+\|.*$", "", place).strip().lower()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            unique_places.append(re.sub(r"\s+\|.*$", "", place).strip())
 
-    top_places = unique_places[:5]
-    place_lines = "\n".join(f"{idx}. {name}" for idx, name in enumerate(top_places, start=1))
+    top_places = unique_places[:6]
+    if not top_places:
+        return f"Could not extract specific tourist spots for '{city}'."
+
+    place_lines = "\n".join(
+        f"{idx}. {name}\n   Best time: {_best_visit_time_for_place(name)}"
+        for idx, name in enumerate(top_places, start=1)
+    )
 
     return f"""
 Best Tourist Spots — {city}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Top recommendations:
+Recommended places and best timings:
 {place_lines}
 
-Tips:
-- Visit popular landmarks early morning to avoid crowds.
-- Keep at least one indoor attraction as backup for bad weather.
-- Check official timings and ticket details before visiting.
+Planning note:
+- Weekdays are usually less crowded than weekends.
+- Recheck official opening hours before travel.
 """.strip()
 
 
