@@ -25,6 +25,8 @@ USER_AGENT   = "weather-app/1.0"
 
 
 # ── Helper: call SerpApi ─────────────────────────────────────────
+# Use engine="google" for weather/AQI/forecast/sun queries.
+# Use engine="google_maps" for place discovery/map queries.
 async def fetch_serpapi(query: str, engine: str = "google") -> dict[str, Any] | None:
     """
     Send a search query to SerpApi and return the parsed JSON.
@@ -362,7 +364,7 @@ async def get_current_weather(city: str) -> str:
     Args:
         city: The city name to get weather for, e.g. 'Delhi', 'Mumbai', 'London'
     """
-    data = await fetch_serpapi(f"weather in {city}") or {}
+    data = await fetch_serpapi(f"weather in {city}", engine="google") or {}
     answer = data.get("answer_box", {}) or {}
 
     location = str(answer.get("location") or city)
@@ -401,32 +403,25 @@ async def get_current_weather(city: str) -> str:
     dew_point_c = _to_int(answer.get("dew_point")) or 0
     cloud_cover_percent = _to_int(answer.get("cloud_cover")) or 0
 
-    sun_data = await fetch_serpapi(f"sunrise sunset time {city}") or {}
+    sun_data = await fetch_serpapi(f"sunrise sunset time {city}", engine="google") or {}
     sun_answer = sun_data.get("answer_box", {}) or {}
     sunrise = str(sun_answer.get("sunrise") or "06:00 AM")
     sunset = str(sun_answer.get("sunset") or "06:00 PM")
-
-    aqi_data = await fetch_serpapi(f"air quality index {city}") or {}
-    aqi, aqi_category = _extract_aqi_fields(aqi_data)
 
     carry: list[str] = []
     if uv_index > 5:
         carry.extend(["sunscreen", "water bottle"])
     if precipitation_mm > 0:
         carry.append("umbrella")
-    if aqi > 100:
-        carry.append("mask")
     if not carry:
         carry.append("water bottle")
 
-    outdoor_safe = not (uv_index >= 8 or aqi > 150 or precipitation_mm > 10)
+    outdoor_safe = not (uv_index >= 8 or precipitation_mm > 10)
     reason = "Conditions are generally suitable for outdoor plans."
     if not outdoor_safe:
         reasons: list[str] = []
         if uv_index >= 8:
             reasons.append("UV index is very high")
-        if aqi > 150:
-            reasons.append("AQI is unhealthy")
         if precipitation_mm > 10:
             reasons.append("heavy rain is likely")
         reason = ". ".join(reasons) + ". Limit outdoor exposure."
@@ -449,8 +444,6 @@ async def get_current_weather(city: str) -> str:
             "uv_risk": uv_risk,
             "condition": condition,
             "condition_icon": icon,
-            "aqi": aqi,
-            "aqi_category": aqi_category,
             "sunrise": sunrise,
             "sunset": sunset,
             "pressure_hpa": pressure_hpa,
@@ -479,7 +472,7 @@ async def get_weather_forecast(city: str) -> str:
     Args:
         city: The city name to get the forecast for, e.g. 'Delhi', 'Mumbai', 'London'
     """
-    data = await fetch_serpapi(f"weather in {city}")
+    data = await fetch_serpapi(f"weather in {city}", engine="google")
 
     if not data:
         return "Error: Could not connect to SerpApi. Check your API key."
@@ -521,9 +514,9 @@ async def get_aqi(city: str) -> str:
     Args:
         city: The city name to get AQI for, e.g. 'Delhi', 'Mumbai', 'London'
     """
-    data = await fetch_serpapi(f"air quality index {city}")
+    data = await fetch_serpapi(f"air quality index {city}", engine="google")
     if not data:
-        return "Error: Could not connect to SerpApi. Check your API key and internet connection."
+        return "Error: Could not fetch AQI from SerpApi. Check SERPAPI_API_KEY and internet connection."
 
     answer = data.get("answer_box", {}) or {}
     local_results = data.get("local_results", []) or []
@@ -582,6 +575,7 @@ async def get_aqi(city: str) -> str:
             "aqi_present": aqi_num is not None,
             "pm25_present": pm25 is not None,
             "pm10_present": pm10 is not None,
+            "source": "serpapi",
         },
     }
     return json.dumps(payload, indent=2)
