@@ -4,6 +4,8 @@ import json
 import re
 import sys
 from typing import Any
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import httpx
 from mcp.server.fastmcp import FastMCP
 from dotenv import load_dotenv
@@ -263,6 +265,92 @@ def _health_advice_from_status(status: str) -> str:
     return "Air quality is acceptable for most people."
 
 
+def _uv_risk_from_index(uv_index: int) -> str:
+    if uv_index <= 2:
+        return "Low"
+    if uv_index <= 5:
+        return "Moderate"
+    if uv_index <= 7:
+        return "High"
+    if uv_index <= 10:
+        return "Very High"
+    return "Extreme"
+
+
+def _compass_from_wind_text(wind_text: str) -> str:
+    if not wind_text:
+        return "N"
+    upper = wind_text.upper()
+    for label in ["NE", "NW", "SE", "SW", "N", "E", "S", "W"]:
+        if re.search(rf"\b{label}\b", upper):
+            return label
+    return "N"
+
+
+def _condition_icon(condition: str) -> str:
+    text = condition.lower()
+    if "thunder" in text:
+        return "⛈️"
+    if "rain" in text or "drizzle" in text:
+        return "🌧️"
+    if "snow" in text:
+        return "❄️"
+    if "fog" in text or "mist" in text or "haze" in text:
+        return "🌫️"
+    if "cloud" in text or "overcast" in text:
+        return "☁️"
+    if "clear" in text or "sunny" in text:
+        return "☀️"
+    return "🌤️"
+
+
+def _city_country_from_location(location: str, fallback_city: str) -> tuple[str, str]:
+    if not location:
+        return fallback_city, "Unknown"
+    parts = [part.strip() for part in location.split(",") if part.strip()]
+    if len(parts) >= 2:
+        return parts[0], parts[-1]
+    return location.strip(), "Unknown"
+
+
+def _timezone_for_country(country: str) -> str:
+    mapping = {
+        "india": "Asia/Kolkata",
+        "usa": "America/New_York",
+        "united states": "America/New_York",
+        "uk": "Europe/London",
+        "united kingdom": "Europe/London",
+        "uae": "Asia/Dubai",
+        "australia": "Australia/Sydney",
+        "canada": "America/Toronto",
+    }
+    return mapping.get(country.lower(), "UTC")
+
+
+def _extract_aqi_fields(data: dict[str, Any]) -> tuple[int, str]:
+    search_space: dict[str, Any] = {
+        "answer_box": data.get("answer_box", {}) or {},
+        "knowledge_graph": data.get("knowledge_graph", {}) or {},
+        "local_results": data.get("local_results", []) or [],
+        "organic_results": data.get("organic_results", []) or [],
+    }
+    aqi_raw = (
+        _find_first_value(search_space, {"aqi", "value", "aqi_value", "us_aqi"})
+        or _find_first_value(search_space, {"current_aqi", "air_quality_index"})
+    )
+    aqi_value = _to_int(_normalize_aqi_value(aqi_raw))
+    status = _find_first_value(search_space, {"status", "category", "quality"}) or "Unknown"
+    if aqi_value is None:
+        all_text = " ".join(_collect_strings(search_space))
+        parsed = _extract_aqi_from_text(all_text)
+        aqi_value = _to_int(parsed)
+    if aqi_value is None:
+        aqi_value = 0
+    if status == "Unknown" or _normalize_aqi_value(status):
+        status = _aqi_status_from_value(aqi_value)
+    return aqi_value, status
+
+
 # ── Tool 1: Current weather ──────────────────────────────────────
 @mcp.tool()
 async def get_current_weather(city: str) -> str:
@@ -274,29 +362,110 @@ async def get_current_weather(city: str) -> str:
     Args:
         city: The city name to get weather for, e.g. 'Delhi', 'Mumbai', 'London'
     """
-    data = await fetch_serpapi(f"weather in {city}")
+    data = await fetch_serpapi(f"weather in {city}") or {}
+    answer = data.get("answer_box", {}) or {}
 
-    if not data:
-        return f"Error: Could not connect to SerpApi. Check your API key and internet connection."
+    location = str(answer.get("location") or city)
+    city_name, country = _city_country_from_location(location, city)
+    timezone = _timezone_for_country(country)
+    now_local = datetime.now(ZoneInfo(timezone))
+    last_updated = now_local.isoformat(timespec="seconds")
 
-    answer = data.get("answer_box", {})
+    temp_val = _to_float(answer.get("temperature")) or 0.0
+    unit = str(answer.get("unit") or "F").upper()
+    if unit == "C":
+        temperature_c = round(temp_val)
+        temperature_f = round((temp_val * 9.0 / 5.0) + 32.0)
+    else:
+        temperature_f = round(temp_val)
+        temperature_c = round((temp_val - 32.0) * 5.0 / 9.0)
 
-    # SerpApi puts current weather inside answer_box with type "weather_result"
-    if answer.get("type") != "weather_result":
-        return f"Could not find live weather for '{city}'. Try a more specific city name, e.g. 'Mumbai, India'."
+    feels_like_c = temperature_c
+    feels_like_f = temperature_f
+    humidity = _to_int(answer.get("humidity")) or 0
+    if humidity >= 70 and temperature_c >= 30:
+        feels_like_c = temperature_c + 3
+        feels_like_f = round((feels_like_c * 9.0 / 5.0) + 32.0)
 
-    result = f"""
-Current Weather — {answer.get('location', city)}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Condition     : {answer.get('weather', 'N/A')}
-Temperature   : {answer.get('temperature', 'N/A')}° {answer.get('unit', 'F')}
-Humidity      : {answer.get('humidity', 'N/A')}
-Wind          : {answer.get('wind', 'N/A')}
-Precipitation : {answer.get('precipitation', 'N/A')}
-As of         : {answer.get('date', 'N/A')}
-""".strip()
+    wind_text = str(answer.get("wind") or "")
+    wind_speed_kmh = _to_int(wind_text) or 0
+    wind_direction = _compass_from_wind_text(wind_text)
 
-    return result
+    visibility_km = _to_int(answer.get("visibility")) or 10
+    uv_index = _to_int(answer.get("uv_index")) or 0
+    uv_risk = _uv_risk_from_index(uv_index)
+    condition = str(answer.get("weather") or "Unknown")
+    icon = _condition_icon(condition)
+    precipitation_mm = _to_float(answer.get("precipitation")) or 0.0
+    pressure_hpa = _to_int(answer.get("pressure")) or 0
+    dew_point_c = _to_int(answer.get("dew_point")) or 0
+    cloud_cover_percent = _to_int(answer.get("cloud_cover")) or 0
+
+    sun_data = await fetch_serpapi(f"sunrise sunset time {city}") or {}
+    sun_answer = sun_data.get("answer_box", {}) or {}
+    sunrise = str(sun_answer.get("sunrise") or "06:00 AM")
+    sunset = str(sun_answer.get("sunset") or "06:00 PM")
+
+    aqi_data = await fetch_serpapi(f"air quality index {city}") or {}
+    aqi, aqi_category = _extract_aqi_fields(aqi_data)
+
+    carry: list[str] = []
+    if uv_index > 5:
+        carry.extend(["sunscreen", "water bottle"])
+    if precipitation_mm > 0:
+        carry.append("umbrella")
+    if aqi > 100:
+        carry.append("mask")
+    if not carry:
+        carry.append("water bottle")
+
+    outdoor_safe = not (uv_index >= 8 or aqi > 150 or precipitation_mm > 10)
+    reason = "Conditions are generally suitable for outdoor plans."
+    if not outdoor_safe:
+        reasons: list[str] = []
+        if uv_index >= 8:
+            reasons.append("UV index is very high")
+        if aqi > 150:
+            reasons.append("AQI is unhealthy")
+        if precipitation_mm > 10:
+            reasons.append("heavy rain is likely")
+        reason = ". ".join(reasons) + ". Limit outdoor exposure."
+
+    payload = {
+        "city": city_name,
+        "country": country,
+        "timezone": timezone,
+        "last_updated": last_updated,
+        "current": {
+            "temperature_c": temperature_c,
+            "temperature_f": temperature_f,
+            "feels_like_c": feels_like_c,
+            "feels_like_f": feels_like_f,
+            "humidity_percent": humidity,
+            "wind_speed_kmh": wind_speed_kmh,
+            "wind_direction": wind_direction,
+            "visibility_km": visibility_km,
+            "uv_index": uv_index,
+            "uv_risk": uv_risk,
+            "condition": condition,
+            "condition_icon": icon,
+            "aqi": aqi,
+            "aqi_category": aqi_category,
+            "sunrise": sunrise,
+            "sunset": sunset,
+            "pressure_hpa": pressure_hpa,
+            "dew_point_c": dew_point_c,
+            "cloud_cover_percent": cloud_cover_percent,
+            "precipitation_mm": precipitation_mm,
+        },
+        "travel_advisory": {
+            "outdoor_safe": outdoor_safe,
+            "reason": reason,
+            "recommended_time_outdoors": "Before 9 AM or after 6 PM" if not outdoor_safe else "Anytime except peak noon hours",
+            "carry": carry,
+        },
+    }
+    return json.dumps(payload, indent=2)
 
 
 # ── Tool 2: Multi-day forecast ───────────────────────────────────
