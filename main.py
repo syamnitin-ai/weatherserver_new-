@@ -10,7 +10,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Initialize FastMCP server — the name shows up in Claude Desktop
-mcp = FastMCP("weather")
+# Bind to Render's host/port when deployed; defaults remain local-safe.
+PORT = int(os.getenv("PORT", "8000"))
+mcp = FastMCP("weather", host="0.0.0.0", port=PORT)
 
 # Constants
 SERPAPI_BASE = "https://serpapi.com/search.json"
@@ -126,5 +128,9 @@ if __name__ == "__main__":
     # IMPORTANT: Never use print() here — it writes to stdout and
     # corrupts the JSON-RPC messages Claude sends over stdio.
     # Always use sys.stderr for any debug logging.
-    print("Weather MCP Server starting...", file=sys.stderr)
-    mcp.run(transport="stdio")
+    if os.getenv("RENDER") or os.getenv("PORT"):
+        print(f"Weather MCP Server starting on HTTP transport at 0.0.0.0:{PORT}", file=sys.stderr)
+        mcp.run(transport="streamable-http")
+    else:
+        print("Weather MCP Server starting on stdio transport", file=sys.stderr)
+        mcp.run(transport="stdio")
