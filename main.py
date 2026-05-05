@@ -195,6 +195,41 @@ def _best_visit_time_for_place(place_name: str, category: str) -> str:
     return "8:00 AM - 11:00 AM or 5:00 PM - 7:00 PM (generally best for sightseeing)"
 
 
+def _tourist_intent_score(name: str, category: str) -> int:
+    """Score how likely a place is a true tourist attraction."""
+    combined = f"{name} {category}".lower()
+    attraction_terms = [
+        "temple", "church", "mosque", "shrine", "fort", "palace", "museum",
+        "gallery", "monument", "memorial", "park", "garden", "lake", "beach",
+        "waterfall", "sanctuary", "zoo", "viewpoint", "cave", "island",
+        "heritage", "landmark", "attraction", "planetarium", "science",
+    ]
+    non_tourist_terms = [
+        "jewellery", "jewelry", "gold", "silver", "store", "shop", "hospital",
+        "clinic", "school", "college", "bank", "atm", "salon", "spa",
+        "hardware", "agency", "real estate", "wholesaler", "factory",
+    ]
+    score = 0
+    if any(term in combined for term in attraction_terms):
+        score += 4
+    if any(term in combined for term in non_tourist_terms):
+        score -= 6
+    return score
+
+
+def _place_tip(name: str, category: str) -> str:
+    combined = f"{name} {category}".lower()
+    if "temple" in combined or "shrine" in combined:
+        return "Carry modest clothing and avoid peak prayer hours for shorter queues."
+    if any(word in combined for word in ["park", "garden", "lake", "beach"]):
+        return "Carry water and sunscreen; sunset hours are usually most scenic."
+    if any(word in combined for word in ["museum", "gallery", "planetarium"]):
+        return "Book tickets online if available to skip queue."
+    if any(word in combined for word in ["sanctuary", "zoo", "wildlife"]):
+        return "Visit in the morning when animal activity is highest."
+    return "Visit on weekdays and check opening hours before leaving."
+
+
 def _aqi_status_from_value(aqi_value: int | None) -> str:
     if aqi_value is None:
         return "Unknown"
@@ -413,10 +448,18 @@ async def get_best_tourist_spots(city: str) -> str:
                 continue
 
             category = str(item.get("type") or item.get("category") or "attraction").strip()
+            intent_score = _tourist_intent_score(name, category)
+            if intent_score < 0:
+                continue
             address = str(item.get("address") or "N/A").strip()
             rating = _to_float(item.get("rating"))
             reviews = _to_int(item.get("reviews"))
             price = item.get("price")
+            place_id = str(item.get("place_id") or item.get("data_id") or "").strip()
+            phone = str(item.get("phone") or "N/A").strip()
+            website = str(item.get("website") or "N/A").strip()
+            hours = str(item.get("hours") or item.get("open_state") or "N/A").strip()
+            photos = item.get("photos_link") or item.get("thumbnail") or None
 
             gps = item.get("gps_coordinates") or {}
             latitude = _to_float(gps.get("latitude"))
@@ -435,14 +478,20 @@ async def get_best_tourist_spots(city: str) -> str:
                 "address": address,
                 "rating": rating,
                 "review_count": reviews,
+                "place_id": place_id or None,
                 "coordinates": {
                     "lat": latitude,
                     "lng": longitude,
                 },
+                "opening_hours": hours,
                 "entry_fee": entry_fee,
                 "best_time": _best_visit_time_for_place(name, category),
-                "tip": "Visit on weekdays and check opening hours before leaving.",
+                "tip": _place_tip(name, category),
+                "phone": phone,
+                "website": website,
+                "photos": photos,
                 "hidden_gem": hidden_gem,
+                "tourist_intent_score": intent_score,
             }
             all_candidates.append(place_obj)
 
@@ -468,9 +517,9 @@ async def get_best_tourist_spots(city: str) -> str:
 
     deduped.sort(
         key=lambda p: (
+            -(p["tourist_intent_score"] or 0),
             p["rating"] is None,
-            -(p["rating"] or 0.0),
-            -(p["review_count"] or 0),
+            -((p["rating"] or 0.0) * 20.0 + min((p["review_count"] or 0), 6000) / 300.0),
         )
     )
     top_places = deduped[:10]
